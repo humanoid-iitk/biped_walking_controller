@@ -559,13 +559,6 @@ def keyboard_listener_thread():
             abort_walk = False
             current_command = 'walk_square'
             
-        elif ch in ['c', 'C']:
-            print("\n>>> QUEUING STAIR CLIMB <<<")
-            abort_walk = True
-            time.sleep(0.15)
-            abort_walk = False
-            current_command = 'stair_climb'
-            
         elif ch == ' ':
             print("\n>>> SPACEBAR PRESSED: INSTANT KILL SWITCH <<<")
             global is_shutting_down
@@ -648,48 +641,6 @@ def execute_turn(total_angle, dir_sign):
         print("Recentering weight...")
         transition_to(0.23, 0.23, 0.0, 0.0, 0.0, 0.0, 0.3)
 
-def stair_climb_sequence(stair_height=0.03, step_depth=0.10):
-    print(f"\n=== EXECUTING STAIR CLIMB (Height: {stair_height*100:.1f}cm) ===")
-    
-    h_stand = 0.22
-    clearance = 0.05
-    h_lift = h_stand - stair_height - clearance
-    if h_lift < 0.10: h_lift = 0.10
-    
-    h_crouch_back = 0.22
-    h_crouch_front = h_crouch_back - stair_height
-    
-    print("Stage 1: Pre-Crouch (Double Support)...")
-    transition_to(h_stand, h_stand, 0.0, 0.0, 0.0, 0.0, 0.5)
-    
-    print("Stage 2: Heavy Left Shift (Weight on Left)...")
-    transition_to(h_stand, h_stand, 0.35, 0.35, 0.0, 0.0, 0.7)
-    
-    print("Stage 3: Right Knee Lift (Clear stair lip)...")
-    transition_to(h_stand, h_lift, 0.35, 0.35, 0.0, 0.0, 0.6)
-    
-    print("Stage 4: Right Forward Reach...")
-    transition_to(h_stand, h_lift, 0.35, 0.35, 0.0, step_depth, 0.6)
-    
-    print("Stage 5: Right Touchdown on Stair...")
-    transition_to(h_crouch_back, h_crouch_front, 0.35, 0.35, 0.0, step_depth, 0.5)
-    
-    print("Stage 6: Forward Weight Shift & Push-Up...")
-    transition_to(h_crouch_back, h_crouch_front, -0.30, -0.30, -step_depth, 0.0, 0.8)
-    
-    print("Stage 7: Left Leg Trail Lift...")
-    transition_to(h_lift, h_crouch_front, -0.30, -0.30, -step_depth, 0.0, 0.6)
-    
-    print("Stage 8: Left Leg Forward...")
-    transition_to(h_lift, h_crouch_front, -0.30, -0.30, 0.0, 0.0, 0.6)
-    
-    print("Stage 9: Left Touchdown on Stair...")
-    transition_to(h_crouch_front, h_crouch_front, -0.30, -0.30, 0.0, 0.0, 0.5)
-    
-    print("Stage 10: Stand Up on New Level...")
-    transition_to(h_stand, h_stand, 0.0, 0.0, 0.0, 0.0, 0.7)
-    print("=== STAIR CLIMB COMPLETE ===")
-
 def walk_square():
     print("\n>>> EXECUTING SQUARE WALK <<<")
     for i in range(4):
@@ -707,7 +658,6 @@ def state_machine_thread():
     global current_command
     time.sleep(1.0)
     print("\n[ENTER: Walk | 'q': Left | 'e': Right | 's': Square | 'w': Weightlifting | 'k': Shutdown | SPACE: Kill]")
-    print("\n[ENTER: Walk | 'q': Left | 'e': Right | 's': Square | 'w': Weightlifting | 'c': Stair Climb | 'k': Shutdown | SPACE: Kill]")
     while True:
         while current_command is None:
             time.sleep(0.05)
@@ -726,8 +676,6 @@ def state_machine_thread():
                 walk_square()
             elif cmd == 'weightlifting':
                 weightlifting()
-            elif cmd == 'stair_climb':
-                stair_climb_sequence(stair_height=0.03)
 
         except AbortWalk:
             print("Motion Aborted.")
