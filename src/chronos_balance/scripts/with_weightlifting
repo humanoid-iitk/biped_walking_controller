@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""
+ik_step_physical.py — 10-DOF Humanoid Step Controller for Real Hardware (AX-12A)
+"""
+
+import math
+import time
+import threading
+import sys
+import termios
+import tty
+import os
+from dynamixel_sdk import *
+
+# =============================================================================
+# 1. HARDWARE CONFIGURATION & TRANSLATION
+# =============================================================================
+TICKS_PER_RADIAN = 1024 / (300.0 * math.pi / 180.0)
+
+
+ADDR_AX_GOAL_POSITION = 30
+LEN_AX_GOAL_POSITION  = 2
+PROTOCOL_VERSION      = 1.0
+BAUDRATE              = 1000000  
+DEVICENAME            = '/dev/cu.usbserial-FTBEQE6D' # Detected Linux serial port
+
+
+ROBOT_CONFIG = {
+    # --- UPPER BODY (ARMS) ---
+    1:  {"name": "Shoulder Pitch R", "offset": 497, "dir": 1},
+    2:  {"name": "Shoulder Pitch L", "offset": 525, "dir": -1},
+    3:  {"name": "Shoulder Roll R",  "offset": 363, "dir": 1},
+    4:  {"name": "Shoulder Roll L",  "offset": 366, "dir": -1},
+    5:  {"name": "Elbow R",          "offset": 42,  "dir": 1},
+    6:  {"name": "Elbow L",          "offset": 667, "dir": 1},
+
+    # --- YAW / WAIST ---
+    7:  {"name": "Arm/Torso L",      "offset": 664, "dir": 1},
+    8:  {"name": "Arm/Torso R",      "offset": 661, "dir": 1},
+    
+    # --- RIGHT LEG (Odds) ---
+    9:  {"name": "Hip Roll R",       "offset": 500, "dir": 1},
+    11: {"name": "Hip Pitch R",      "offset": 508, "dir": -1},
+    13: {"name": "Knee R",           "offset": 514, "dir": -1},
+    15: {"name": "Ankle Pitch R",    "offset": 534, "dir":-1},
+    17: {"name": "Ankle Roll R",     "offset": 504, "dir": 1},
+    
+    # --- LEFT LEG (Evens) ---
+    10: {"name": "Hip Roll L",       "offset": 396, "dir": 1},
+    12: {"name": "Hip Pitch L",      "offset": 525, "dir": -1},
+    14: {"name": "Knee L",           "offset": 512, "dir": 1},
+    16: {"name": "Ankle Pitch L",    "offset": 201, "dir": -1},
+    18: {"name": "Ankle Roll L",     "offset": 523, "dir": 1}
+}
+
+SHUTDOWN_TICKS = {
+    1: 494, 2: 505, 3: 343, 4: 367, 5: 42, 6: 666,
+    7: 674, 8: 668,
+    9: 510, 10: 406,
+    11: 260, 12: 756,
+    13: 27, 14: 988,
+    15: 304, 16: 0,
+    17: 512, 18: 533
+}
+
+is_shutting_down = False
+ik_override = False
+g_portHandler = None
+g_packetHandler = None
+g_groupSyncWrite = None
+target_yaw_left = 0.0
+target_yaw_right = 0.0
+target_arm_radians = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0}
+
+def rad_to_tick(motor_id, radian_cmd):
+    """Translates IK radians to AX-12A ticks."""
+    config = ROBOT_CONFIG[motor_id]
+    tick_delta = radian_cmd * TICKS_PER_RADIAN * config["dir"]
+    target_tick = int(config["offset"] + tick_delta)
+    return max(0, min(1023, target_tick))
+
+# =============================================================================
+# 2. LEG LENGTHS & TARGETS
+# =============================================================================
+L1 = 0.11
+L2 = 0.116
+
+# ==========================================================
+# Gait Parameters
+# ==========================================================
+RIGHT_STEP_LENGTH = 0.10
+LEFT_STEP_LENGTH = 0.10
+SUPPORT_RATIO = 0.75
+
+STAGE6_SUPPORT_OFFSET = 0.02
+
+KNEE_MARGIN = 0.006 
+STAGE6_KNEE_MARGIN = 0.012    
+
+MAX_H_DIFF = 0.015      
+
+
+target_h_left = 0.23
+target_h_right = 0.23
+target_shift_left = 0.0
+target_shift_right = 0.0
+target_x_left = 0.0
+target_x_right = 0.0
+target_torso_lean = 0.0
+
+current_h_left = 0.23
+current_h_right = 0.23
+current_shift_left = 0.0
+current_shift_right = 0.0
+current_x_left = 0.0
+current_x_right = 0.0
+current_yaw_left = 0.0
+current_yaw_right = 0.0
+current_torso_lean = 0.0
+current_arm_radians = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0}
+
+# =============================================================================
+# 3. SYSTEMATIC 6-STAGE GAIT STATE MACHINE
+# =============================================================================
+class AbortWalk(Exception): pass
+abort_walk = False
+
+def set_targets(h_l, h_r, shift_l, shift_r, x_l, x_r, delay):
+    global target_h_left, target_h_right, target_shift_left, target_shift_right, target_x_left, target_x_right
+    if abort_walk: raise AbortWalk()
+    
+    target_h_left = h_l
+    target_h_right = h_r
+    target_shift_left = shift_l
+    target_shift_right = shift_r
+    target_x_left = x_l
+    target_x_right = x_r
+    time.sleep(delay)
+
+def transition_to(h_l, h_r, shift_l, shift_r, x_l, x_r, duration):
+    """Smoothly interpolates targets over a precise duration to eliminate jerky snaps."""
+    global target_h_left, target_h_right, target_shift_left, target_shift_right, target_x_left, target_x_right
+    
+    start_h_l = target_h_left
+    start_h_r = target_h_right
+    start_shift_l = target_shift_left
+    start_shift_r = target_shift_right
+    start_x_l = target_x_left
+    start_x_r = target_x_right
+    
+    steps = int(duration * 20)  # 20 steps per second
+    if steps <= 0: steps = 1
+    dt = duration / steps
+    
+    for i in range(1, steps + 1):
+        t = i / float(steps)
+        # Cosine ease-in/out for extra smoothness!
+        ease = (1 - math.cos(t * math.pi)) / 2.0
+        
+        cur_h_l = start_h_l + ease * (h_l - start_h_l)
+        cur_h_r = start_h_r + ease * (h_r - start_h_r)
+        cur_shift_l = start_shift_l + ease * (shift_l - start_shift_l)
+        cur_shift_r = start_shift_r + ease * (shift_r - start_shift_r)
+        cur_x_l = start_x_l + ease * (x_l - start_x_l)
+        cur_x_r = start_x_r + ease * (x_r - start_x_r)
+        
+        set_targets(cur_h_l, cur_h_r, cur_shift_l, cur_shift_r, cur_x_l, cur_x_r, dt)
+
+def generate_stage5(step_length):
+    x_r = SUPPORT_RATIO * step_length
+    x_l = -(step_length - x_r)
+    hmax_l = math.sqrt((L1 + L2)**2 - x_l*x_l)
+    hmax_r = math.sqrt((L1 + L2)**2 - x_r*x_r)
+    h_l = hmax_l - KNEE_MARGIN
+    h_r = hmax_r - KNEE_MARGIN
+    if abs(h_l-h_r) > MAX_H_DIFF:
+        if h_l > h_r: h_l = h_r + MAX_H_DIFF
+        else: h_r = h_l + MAX_H_DIFF
+    shift_l = 0.10
+    shift_r = 0.10
+    return h_l,h_r,shift_l,shift_r,x_l,x_r
+
+def generate_stage6(step_length):
+    x_r = STAGE6_SUPPORT_OFFSET
+    x_l = -(step_length - x_r)
+    hmax_l = math.sqrt((L1+L2)**2 - x_l*x_l)
+    hmax_r = math.sqrt((L1+L2)**2 - x_r*x_r)
+    h_l = hmax_l - STAGE6_KNEE_MARGIN
+    h_r = hmax_r - STAGE6_KNEE_MARGIN
+    if abs(h_l-h_r) > MAX_H_DIFF:
+        if h_l > h_r: h_l = h_r + MAX_H_DIFF
+        else: h_r = h_l + MAX_H_DIFF
+    shift_l = -0.30
+    shift_r = -0.30
+    return h_l,h_r,shift_l,shift_r,x_l,x_r
+
+def generate_stage7(step_length):
+    x_l = SUPPORT_RATIO * step_length
+    x_r = -(step_length - x_l)
+    hmax_l = math.sqrt((L1+L2)**2 - x_l*x_l)
+    hmax_r = math.sqrt((L1+L2)**2 - x_r*x_r)
+    h_l = hmax_l - KNEE_MARGIN
+    h_r = hmax_r - KNEE_MARGIN
+    if abs(h_l-h_r) > MAX_H_DIFF:
+        if h_l > h_r: h_l = h_r + MAX_H_DIFF
+        else: h_r = h_l + MAX_H_DIFF
+    shift_l_start = -0.40
+    shift_l_end   = -0.35
+    shift_r = -0.30
+    return (h_l, h_r, shift_l_start, shift_l_end, shift_r, x_l, x_r)
+
+def generate_stage8(step_length):
+    x_l = SUPPORT_RATIO * step_length
+    x_r = -(step_length - x_l)
+    hmax_l = math.sqrt((L1+L2)**2 - x_l*x_l)
+    hmax_r = math.sqrt((L1+L2)**2 - x_r*x_r)
+    h_l = hmax_l - KNEE_MARGIN
+    h_r = hmax_r - KNEE_MARGIN
+    if abs(h_l-h_r) > MAX_H_DIFF:
+        if h_l > h_r: h_l = h_r + MAX_H_DIFF
+        else: h_r = h_l + MAX_H_DIFF
+    shift_l = -0.10
+    shift_r = -0.10
+    return h_l,h_r,shift_l,shift_r,x_l,x_r
+
+def generate_stage9(step_length):
+    x_l = STAGE6_SUPPORT_OFFSET
+    x_r = -(step_length - x_l)
+    hmax_l = math.sqrt((L1+L2)**2 - x_l*x_l)
+    hmax_r = math.sqrt((L1+L2)**2 - x_r*x_r)
+    h_l = hmax_l - STAGE6_KNEE_MARGIN
+    h_r = hmax_r - STAGE6_KNEE_MARGIN
+    if abs(h_l-h_r) > MAX_H_DIFF:
+        if h_l > h_r: h_l = h_r + MAX_H_DIFF
+        else: h_r = h_l + MAX_H_DIFF
+    shift_l = 0.30
+    shift_r = 0.30
+    return h_l,h_r,shift_l,shift_r,x_l,x_r
+
+def generate_stage10(step_length):
+    x_r = SUPPORT_RATIO * step_length
+    x_l = -(step_length - x_r)
+    hmax_l = math.sqrt((L1+L2)**2 - x_l*x_l)
+    hmax_r = math.sqrt((L1+L2)**2 - x_r*x_r)
+    h_l = hmax_l - KNEE_MARGIN
+    h_r = hmax_r - KNEE_MARGIN
+    if abs(h_l-h_r) > MAX_H_DIFF:
+        if h_l > h_r: h_l = h_r + MAX_H_DIFF
+        else: h_r = h_l + MAX_H_DIFF
+    shift_r_start = 0.40
+    shift_r_end   = 0.35
+    shift_l = 0.30
+    return (h_l, h_r, shift_l, shift_r_start, shift_r_end, x_l, x_r)
+
+def swing_trajectory_right(duration):
+    steps = 50
+    dt = duration / steps
+    h_l_final, h_r_final, shift_l_final, shift_r_final, x_l_final, x_r_final = generate_stage5(RIGHT_STEP_LENGTH)
+        
+    for i in range(steps + 1):
+        t = i / float(steps)
+        x_r = t*x_r_final
+        x_l = t*x_l_final
+        h_linear = 0.17 + t*(h_r_final-0.17)
+        h_r = h_linear - 0.03*math.sin(math.pi*t)
+        com_lateral_sway = 0.03 * math.sin(math.pi * t)
+        shift_l = 0.30
+        shift_r = (0.40 - t* 0.05) + com_lateral_sway
+        x_com = 2.0 + 2.0 * t
+        com_bump = 0.015625 * ((x_com - 4.0) ** 2) * (x_com - 2.0)
+        h_l = h_l_final + 0.5*com_bump
+        set_targets(h_l, h_r, shift_l, shift_r, x_l, x_r, dt)
+
+def swing_trajectory_left(duration):
+    steps = 50
+    dt = duration / steps
+    h_l_start, h_r_start, _, _, x_l_start, x_r_start = generate_stage6(RIGHT_STEP_LENGTH)
+    (h_l_final, h_r_final, shift_l_start, shift_l_end, shift_r_const, x_l_final, x_r_final) = generate_stage7(LEFT_STEP_LENGTH)
+    
+    for i in range(steps + 1):
+        t = i / float(steps)
+        x_l = x_l_start + t * (x_l_final - x_l_start)
+        x_r = x_r_start + t * (x_r_final - x_r_start)
+        com_bump = 0.02 * math.sin(math.pi * t)
+        h_linear = h_l_start + t * (h_l_final - h_l_start)
+        h_l = h_linear - 0.03 * math.sin(math.pi * t)
+        h_r = h_r_final + 0.5 * com_bump
+        shift_l = shift_l_start + t * (shift_l_end - shift_l_start)+0.04
+        shift_r = shift_r_const +0.02
+        set_targets(h_l, h_r, shift_l, shift_r, x_l, x_r, dt)
+
+def swing_trajectory_right_continuous(duration):
+    steps = 50
+    dt = duration / steps
+    h_l_start, h_r_start, _, _, x_l_start, x_r_start = generate_stage9(LEFT_STEP_LENGTH)
+    (h_l_final, h_r_final, shift_l_const, shift_r_start, shift_r_end, x_l_final, x_r_final) = generate_stage10(RIGHT_STEP_LENGTH)
+    
+    for i in range(steps + 1):
+        t = i / float(steps)
+        x_l = x_l_start + t * (x_l_final - x_l_start)
+        x_r = x_r_start + t * (x_r_final - x_r_start)
+        com_bump = 0.02 * math.sin(math.pi * t)
+        h_linear = h_r_start + t * (h_r_final - h_r_start)
+        h_r = h_linear - 0.07 * math.sin(math.pi * t)
+        h_l = h_l_final + 0.5 * com_bump
+        shift_r = shift_r_start + t * (shift_r_end - shift_r_start)+0.04
+        shift_l = shift_l_const + 0.02
+        set_targets(h_l, h_r, shift_l, shift_r, x_l, x_r, dt)
+
+def interpolate_18_motors(target_ticks, duration):
+    if abort_walk: return
+    
+    initial_ticks = {}
+    for motor_id in ROBOT_CONFIG.keys():
+        tick, result, error = g_packetHandler.read2ByteTxRx(g_portHandler, motor_id, 36)
+        if result == COMM_SUCCESS:
+            initial_ticks[motor_id] = tick
+        else:
+            initial_ticks[motor_id] = target_ticks[motor_id]
+            
+    steps = int(duration * 100)
+    if steps <= 0: steps = 1
+    
+    for i in range(1, steps + 1):
+        if abort_walk: return
+        start_t = time.perf_counter()
+        t = i / float(steps)
+        ease = (1 - math.cos(t * math.pi)) / 2.0
+        
+        g_groupSyncWrite.clearParam()
+        for m_id in ROBOT_CONFIG.keys():
+            current_tick = int(initial_ticks[m_id] + ease * (target_ticks[m_id] - initial_ticks[m_id]))
+            g_groupSyncWrite.addParam(m_id, [DXL_LOBYTE(current_tick), DXL_HIBYTE(current_tick)])
+            
+        g_groupSyncWrite.txPacket()
+        elapsed = time.perf_counter() - start_t
+        if elapsed < 0.01:
+            time.sleep(0.01 - elapsed)
+
+def weightlifting(num_steps=10):
+    global target_arm_radians, target_yaw_left, target_yaw_right, target_torso_lean, ik_override
+    global current_arm_radians, current_yaw_left, current_yaw_right, current_torso_lean
+    print("\n=== STARTING WEIGHTLIFTING MODE ===")
+    
+    print("Pausing main IK loop...")
+    ik_override = True
+    time.sleep(0.05)
+    
+    print("Reaching down (crouching entire body to shutdown pose)...")
+    interpolate_18_motors(SHUTDOWN_TICKS, 1.5)
+    
+    print("Lifting the weight up slowly (moving hands to weightlifting pose)...")
+    wl_target = dict(SHUTDOWN_TICKS)
+    wl_ticks = {
+        1: 197, 2: 819, 3: 235, 4: 493, 5: 203, 6: 532,
+        7: 661, 8: 662
+    }
+    for m in range(1, 9):
+        wl_target[m] = wl_ticks[m]
+        
+    interpolate_18_motors(wl_target, 2.5)
+    time.sleep(1.0)
+    
+    print("Standing up with weight (interpolating legs back to standing IK)...")
+    # Target torso lean is 0.035 for backward lean while standing
+    target_torso_lean = 0.035
+    
+    # Calculate exactly what the IK loop will demand when it wakes up
+    lh_hip, lh_knee, lh_ankle = compute_human_ik(0.23, 0.0 + target_torso_lean)
+    rh_hip, rh_knee, rh_ankle = compute_human_ik(0.23, 0.0 + target_torso_lean)
+    
+    standing_rads = {
+        9: 0.0, 11: rh_hip, 13: -rh_knee, 15: rh_ankle, 17: 0.0,
+        10: 0.0, 12: -lh_hip, 14: -lh_knee, 16: lh_ankle, 18: 0.0
+    }
+    
+    stand_target = dict(wl_target)
+    for m in range(9, 19):
+        stand_target[m] = rad_to_tick(m, standing_rads[m])
+        
+    interpolate_18_motors(stand_target, 2.0)
+    
+    print("Synchronizing states and handing control back to IK loop...")
+    for m in range(1, 7):
+        target_arm_radians[m] = tick_to_rad(m, wl_ticks[m])
+        current_arm_radians[m] = target_arm_radians[m]
+        
+    target_yaw_left = tick_to_rad(7, wl_ticks[7])
+    target_yaw_right = tick_to_rad(8, wl_ticks[8])
+    current_yaw_left = target_yaw_left
+    current_yaw_right = target_yaw_right
+    current_torso_lean = target_torso_lean
+    
+    ik_override = False
+    time.sleep(0.5)
+    
+    # Walk normally
+    walk_sequence(num_steps)
+    
+    print("Resetting arms to normal pose...")
+    target_torso_lean = 0.0
+    for i in range(1, 7):
+        target_arm_radians[i] = 0.0
+    target_yaw_left = 0.0
+    target_yaw_right = 0.0
+    time.sleep(1.5)
+
+def walk_sequence(num_steps=10):
+    print("Resetting to standing pose...")
+    transition_to(0.23, 0.23, 0.0, 0.0, 0.0, 0.0, 2.0)
+    
+    if num_steps < 1:
+        return
+        
+    print("\n=== STEP 1: Initial Right Step ===")
+    print("Stage 1: Pre-Crouch (Double Support)...")
+    transition_to(0.22, 0.22, 0.0, 0.0, 0.0, 0.0, 0.3)
+    
+    print("Stage 2: Left Lateral Shift (Weight on Left)...")
+    transition_to(0.22, 0.22, 0.30, 0.30, 0.00, 0.00, 0.3) 
+    
+    print("Stage 3: Lifting Right Leg...")
+    transition_to(0.22, 0.17, 0.30, 0.40, 0.00, 0.00, 0.6)
+
+    print("Stage 4: Initial Right Swing...")
+    swing_trajectory_right(0.7)
+    
+    print("Stage 5: Right Touchdown...")
+    h_l, h_r, shift_l, shift_r, x_l, x_r = generate_stage5(RIGHT_STEP_LENGTH)
+    transition_to(h_l, h_r, shift_l, shift_r, x_l, x_r, 0.6)
+
+    print("Stage 6: Forward lean (Weight on Right Leg)...")
+    h_l, h_r, shift_l, shift_r, x_l, x_r = generate_stage6(RIGHT_STEP_LENGTH)
+    transition_to(h_l, h_r, shift_l, shift_r, x_l, x_r, 0.6)
+
+    for i in range(2, num_steps + 1):
+        if i % 2 == 0:
+            print(f"\n=== STEP {i}: Continuous Left Step ===")
+            print("Left Swing...")
+            swing_trajectory_left(0.7)
+            
+            print("Left Touchdown...")
+            h_l, h_r, shift_l, shift_r, x_l, x_r = generate_stage8(LEFT_STEP_LENGTH)
+            transition_to(h_l, h_r, shift_l, shift_r, x_l, x_r, 0.6)
+            
+            print("Forward Lean (Weight on Left Leg)...")
+            h_l, h_r, shift_l, shift_r, x_l, x_r = generate_stage9(LEFT_STEP_LENGTH)
+            transition_to(h_l, h_r, shift_l, shift_r, x_l, x_r, 0.6)
+        else:
+            print(f"\n=== STEP {i}: Continuous Right Step ===")
+            print("Continuous Right Swing...")
+            swing_trajectory_right_continuous(0.7)
+            
+            print("Right Touchdown...")
+            h_l, h_r, shift_l, shift_r, x_l, x_r = generate_stage5(RIGHT_STEP_LENGTH)
+            transition_to(h_l, h_r, shift_l, shift_r, x_l, x_r, 0.6)
+            
+            print("Forward Lean (Weight on Right Leg)...")
+            h_l, h_r, shift_l, shift_r, x_l, x_r = generate_stage6(RIGHT_STEP_LENGTH)
+            transition_to(h_l, h_r, shift_l, shift_r, x_l, x_r, 0.6)
+            
+    print("\n--- Walk Complete. Resetting to standing pose... ---")
+    transition_to(0.23, 0.23, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+
+
+def go_to_shutdown_pose():
+    global is_shutting_down
+    is_shutting_down = True
+    time.sleep(0.05) # Allow main loop to pause
+    
+    print("\nReading physical joint positions for shutdown sequence...")
+    initial_ticks = {}
+    for motor_id in SHUTDOWN_TICKS.keys():
+        tick, result, error = g_packetHandler.read2ByteTxRx(g_portHandler, motor_id, 36)
+        if result == COMM_SUCCESS:
+            initial_ticks[motor_id] = tick
+        else:
+            initial_ticks[motor_id] = SHUTDOWN_TICKS[motor_id]
+            
+    print("Synchronously interpolating to Shutdown Pose...")
+    duration = 2.0
+    steps = int(duration * 100)
+    for i in range(1, steps + 1):
+        start_t = time.perf_counter()
+        t = i / float(steps)
+        ease = (1 - math.cos(t * math.pi)) / 2.0
+        
+        g_groupSyncWrite.clearParam()
+        for m_id, target_tick in SHUTDOWN_TICKS.items():
+            current_tick = int(initial_ticks[m_id] + ease * (target_tick - initial_ticks[m_id]))
+            g_groupSyncWrite.addParam(m_id, [DXL_LOBYTE(current_tick), DXL_HIBYTE(current_tick)])
+            
+        g_groupSyncWrite.txPacket()
+        
+        elapsed = time.perf_counter() - start_t
+        if elapsed < 0.01:
+            time.sleep(0.01 - elapsed)
+            
+    print("Robot safely parked. Powering down torque...")
+    for m_id in SHUTDOWN_TICKS.keys():
+        g_packetHandler.write1ByteTxRx(g_portHandler, m_id, 24, 0)
+    
+    g_portHandler.closePort()
+    print("Shutdown complete. Exiting.\n")
+    os._exit(0)
+
+current_command = None
+
+def keyboard_listener_thread():
+    global current_command, abort_walk
+    time.sleep(0.5)
+    while True:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            
+        if ch == 'k' or ch == 'K':
+            print("\n>>> EMERGENCY ABORT TRIGGERED <<<")
+            abort_walk = True
+            time.sleep(0.15) # Wait for state machine to catch exception and exit
+            abort_walk = False # Reset so we can safely transition down
+            
+            print(">>> Safely planting both feet on the ground... <<<")
+            transition_to(0.23, 0.23, 0.0, 0.0, 0.0, 0.0, 1.5)
+            
+            print("\n>>> SHUTDOWN INITIATED (Moving to Rest Pose) <<<")
+            go_to_shutdown_pose()
+            
+        elif ch in ['w', 'W']:
+            print("\n>>> QUEUING WEIGHTLIFTING <<<")
+            abort_walk = True
+            time.sleep(0.15)
+            abort_walk = False
+            current_command = 'weightlifting'
+            
+        elif ch in ['q', 'Q']:
+            print("\n>>> QUEUING LEFT TURN <<<")
+            abort_walk = True
+            time.sleep(0.15)
+            abort_walk = False
+            current_command = 'turn_left'
+            
+        elif ch in ['e', 'E']:
+            print("\n>>> QUEUING RIGHT TURN <<<")
+            abort_walk = True
+            time.sleep(0.15)
+            abort_walk = False
+            current_command = 'turn_right'
+            
+        elif ch in ['s', 'S']:
+            print("\n>>> QUEUING SQUARE WALK <<<")
+            abort_walk = True
+            time.sleep(0.15)
+            abort_walk = False
+            current_command = 'walk_square'
+            
+        elif ch in ['c', 'C']:
+            print("\n>>> QUEUING STAIR CLIMB <<<")
+            abort_walk = True
+            time.sleep(0.15)
+            abort_walk = False
+            current_command = 'stair_climb'
+            
+        elif ch == ' ':
+            print("\n>>> SPACEBAR PRESSED: INSTANT KILL SWITCH <<<")
+            global is_shutting_down
+            is_shutting_down = True
+            print("Disabling Torque on all motors...")
+            for motor_id in ROBOT_CONFIG.keys():
+                g_packetHandler.write1ByteTxRx(
+                    g_portHandler,
+                    motor_id,
+                    24,   # Torque Enable address
+                    0     # Disable torque
+                )
+            print("Torque disabled. Exiting instantly.")
+            os._exit(0)
+            
+        elif ch == '\n' or ch == '\r':
+            if current_command is None:
+                current_command = 'walk'
+
+def execute_turn(total_angle, dir_sign):
+    global target_yaw_left, target_yaw_right
+    direction_str = "LEFT" if dir_sign == -1 else "RIGHT"
+    print(f"\n=== EXECUTING TURN: {direction_str} (Total Angle: {total_angle}) ===")
+    
+    MAX_STEP = 0.3
+    n_full_steps = int(total_angle // MAX_STEP)
+    remainder = total_angle % MAX_STEP
+    
+    steps = [MAX_STEP] * n_full_steps
+    if remainder > 0.01:
+        steps.append(remainder)
+        
+    for i, step_angle in enumerate(steps):
+        print(f"\n--- Turn Step {i+1}/{len(steps)}: {step_angle:.2f} rad ---")
+        
+        print("Stage 1: Pre-Crouch (Double Support)...")
+        transition_to(0.22, 0.22, 0.0, 0.0, 0.0, 0.0, 0.3)
+        
+        if dir_sign == -1: # Left Turn
+            print("Stage 2: Right Lateral Shift (Weight on Right)...")
+            transition_to(0.22, 0.22, -0.30, -0.30, 0.00, 0.00, 0.3)
+            
+            print(f"Stage 3: Lifting Left Leg and Turning Outward by {step_angle:.2f}...")
+            target_yaw_left = -step_angle
+            transition_to(0.17, 0.22, -0.40, -0.30, 0.00, 0.00, 0.4)
+            
+            print("Placing Left Leg on ground...")
+            transition_to(0.22, 0.22, -0.30, -0.30, 0.00, 0.00, 0.3)
+            
+            print("Left Lateral Shift (Weight on Left)...")
+            transition_to(0.22, 0.22, 0.30, 0.30, 0.00, 0.00, 0.3)
+            
+            print("Lifting Right Leg and Swinging Pelvis...")
+            target_yaw_left = 0.0
+            transition_to(0.22, 0.17, 0.30, 0.40, 0.00, 0.00, 0.4)
+            
+            print("Placing Right Leg on ground...")
+            transition_to(0.22, 0.22, 0.30, 0.30, 0.00, 0.00, 0.3)
+        else: # Right Turn
+            print("Stage 2: Left Lateral Shift (Weight on Left)...")
+            transition_to(0.22, 0.22, 0.30, 0.30, 0.00, 0.00, 0.3) 
+            
+            print(f"Stage 3: Lifting Right Leg and Turning Outward by {step_angle:.2f}...")
+            target_yaw_right = step_angle
+            transition_to(0.22, 0.17, 0.30, 0.40, 0.00, 0.00, 0.4)
+            
+            print("Placing Right Leg on ground...")
+            transition_to(0.22, 0.22, 0.30, 0.30, 0.00, 0.00, 0.3)
+            
+            print("Right Lateral Shift (Weight on Right)...")
+            transition_to(0.22, 0.22, -0.30, -0.30, 0.00, 0.00, 0.3)
+            
+            print("Lifting Left Leg and Swinging Pelvis...")
+            target_yaw_right = 0.0
+            transition_to(0.17, 0.22, -0.40, -0.30, 0.00, 0.00, 0.4)
+            
+            print("Placing Left Leg on ground...")
+            transition_to(0.22, 0.22, -0.30, -0.30, 0.00, 0.00, 0.3)
+            
+        print("Recentering weight...")
+        transition_to(0.23, 0.23, 0.0, 0.0, 0.0, 0.0, 0.3)
+
+def stair_climb_sequence(stair_height=0.03, step_depth=0.10):
+    print(f"\n=== EXECUTING STAIR CLIMB (Height: {stair_height*100:.1f}cm) ===")
+    
+    h_stand = 0.22
+    clearance = 0.05
+    h_lift = h_stand - stair_height - clearance
+    if h_lift < 0.10: h_lift = 0.10
+    
+    h_crouch_back = 0.22
+    h_crouch_front = h_crouch_back - stair_height
+    
+    print("Stage 1: Pre-Crouch (Double Support)...")
+    transition_to(h_stand, h_stand, 0.0, 0.0, 0.0, 0.0, 0.5)
+    
+    print("Stage 2: Heavy Left Shift (Weight on Left)...")
+    transition_to(h_stand, h_stand, 0.35, 0.35, 0.0, 0.0, 0.7)
+    
+    print("Stage 3: Right Knee Lift (Clear stair lip)...")
+    transition_to(h_stand, h_lift, 0.35, 0.35, 0.0, 0.0, 0.6)
+    
+    print("Stage 4: Right Forward Reach...")
+    transition_to(h_stand, h_lift, 0.35, 0.35, 0.0, step_depth, 0.6)
+    
+    print("Stage 5: Right Touchdown on Stair...")
+    transition_to(h_crouch_back, h_crouch_front, 0.35, 0.35, 0.0, step_depth, 0.5)
+    
+    print("Stage 6: Forward Weight Shift & Push-Up...")
+    transition_to(h_crouch_back, h_crouch_front, -0.30, -0.30, -step_depth, 0.0, 0.8)
+    
+    print("Stage 7: Left Leg Trail Lift...")
+    transition_to(h_lift, h_crouch_front, -0.30, -0.30, -step_depth, 0.0, 0.6)
+    
+    print("Stage 8: Left Leg Forward...")
+    transition_to(h_lift, h_crouch_front, -0.30, -0.30, 0.0, 0.0, 0.6)
+    
+    print("Stage 9: Left Touchdown on Stair...")
+    transition_to(h_crouch_front, h_crouch_front, -0.30, -0.30, 0.0, 0.0, 0.5)
+    
+    print("Stage 10: Stand Up on New Level...")
+    transition_to(h_stand, h_stand, 0.0, 0.0, 0.0, 0.0, 0.7)
+    print("=== STAIR CLIMB COMPLETE ===")
+
+def walk_square():
+    print("\n>>> EXECUTING SQUARE WALK <<<")
+    for i in range(4):
+        if abort_walk: break
+        print(f"\n--- Square Side {i+1}: Walking 4 Steps ---")
+        walk_sequence(num_steps=4)
+        
+        if abort_walk: break
+        print(f"\n--- Square Corner {i+1}: Turning Right pi/2 ---")
+        execute_turn(math.pi/2, 1)
+        
+    print("\n>>> SQUARE WALK COMPLETE <<<")
+
+def state_machine_thread():
+    global current_command
+    time.sleep(1.0)
+    print("\n[ENTER: Walk | 'q': Left | 'e': Right | 's': Square | 'w': Weightlifting | 'k': Shutdown | SPACE: Kill]")
+    print("\n[ENTER: Walk | 'q': Left | 'e': Right | 's': Square | 'w': Weightlifting | 'c': Stair Climb | 'k': Shutdown | SPACE: Kill]")
+    while True:
+        while current_command is None:
+            time.sleep(0.05)
+            
+        cmd = current_command
+        current_command = None
+        
+        try:
+            if cmd == 'walk':
+                walk_sequence()
+            elif cmd == 'turn_left':
+                execute_turn(3.14, -1)
+            elif cmd == 'turn_right':
+                execute_turn(6.28, 1)
+            elif cmd == 'walk_square':
+                walk_square()
+            elif cmd == 'weightlifting':
+                weightlifting()
+            elif cmd == 'stair_climb':
+                stair_climb_sequence(stair_height=0.03)
+
+        except AbortWalk:
+            print("Motion Aborted.")
+            pass
+
+# =============================================================================
+# 4. FLAWLESS 3-DOF GEOMETRIC IK
+# =============================================================================
+def compute_human_ik(height, x_offset):
+    y = height
+    x = x_offset
+    d = math.sqrt(x*x + y*y)
+    
+    max_len = L1 + L2 - 0.00001
+    d = min(d, max_len)
+
+    cos_knee = (d*d - L1*L1 - L2*L2) / (2 * L1 * L2)
+    cos_knee = max(min(cos_knee, 1.0), -1.0)
+    knee_raw = math.acos(cos_knee)
+
+    knee_geom = -knee_raw
+    hip_geom = math.atan2(x, y) + math.atan2(L2 * math.sin(knee_raw), L1 + L2 * math.cos(knee_raw))
+    ankle_geom = -(hip_geom + knee_geom)
+
+    return hip_geom, knee_geom, ankle_geom
+
+def tick_to_rad(motor_id, tick):
+    config = ROBOT_CONFIG[motor_id]
+    tick_delta = tick - config["offset"]
+    radian = tick_delta / (TICKS_PER_RADIAN * config["dir"])
+    return radian
+
+# =============================================================================
+# 5. MAIN CONTROL LOOP (GroupSyncWrite)
+# =============================================================================
+def main():
+    global target_h_left, target_h_right, target_shift_left, target_shift_right, target_x_left, target_x_right
+
+    # Initialize Dynamixel Port and Packet Handlers
+    portHandler = PortHandler(DEVICENAME)
+    packetHandler = PacketHandler(PROTOCOL_VERSION)
+    groupSyncWrite = GroupSyncWrite(portHandler, packetHandler, ADDR_AX_GOAL_POSITION, LEN_AX_GOAL_POSITION)
+
+    global g_portHandler, g_packetHandler, g_groupSyncWrite
+    g_portHandler = portHandler
+    g_packetHandler = packetHandler
+    g_groupSyncWrite = groupSyncWrite
+
+    if not portHandler.openPort():
+        print(f"Failed to open port {DEVICENAME}. Check connection and permissions.")
+        quit()
+    if not portHandler.setBaudRate(BAUDRATE):
+        print(f"Failed to change the baudrate to {BAUDRATE}")
+        quit()
+
+    print("\nReading physical joint positions for smooth initialization...")
+    initial_radians = {}
+    for motor_id in ROBOT_CONFIG.keys():
+        tick, result, error = packetHandler.read2ByteTxRx(portHandler, motor_id, 36)
+        if result == COMM_SUCCESS:
+            initial_radians[motor_id] = tick_to_rad(motor_id, tick)
+        else:
+            print(f"Warning: Failed to read motor {motor_id}, defaulting to 0.0")
+            initial_radians[motor_id] = 0.0
+
+    # Calculate exact standing IK pose
+    lh_hip, lh_knee, lh_ankle = compute_human_ik(0.23, 0.0)
+    rh_hip, rh_knee, rh_ankle = compute_human_ik(0.23, 0.0)
+    standing_radians = {
+        1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0,
+        7: 0.0, 8: 0.0,
+        9: 0.0, 11: rh_hip, 13: -rh_knee, 15: rh_ankle, 17: 0.0,
+        10: 0.0, 12: -lh_hip, 14: -lh_knee, 16: lh_ankle, 18: 0.0
+    }
+
+    print("--- Initializing: Synchronously interpolating to Standing Pose... ---")
+    duration = 2.0
+    steps = int(duration * 100)
+    for i in range(1, steps + 1):
+        start_t = time.perf_counter()
+        t = i / float(steps)
+        ease = (1 - math.cos(t * math.pi)) / 2.0
+        
+        groupSyncWrite.clearParam()
+        for m_id in ROBOT_CONFIG.keys():
+            current_rad = initial_radians[m_id] + ease * (standing_radians[m_id] - initial_radians[m_id])
+            tick = rad_to_tick(m_id, current_rad)
+            groupSyncWrite.addParam(m_id, [DXL_LOBYTE(tick), DXL_HIBYTE(tick)])
+        
+        groupSyncWrite.txPacket()
+        elapsed = time.perf_counter() - start_t
+        if elapsed < 0.01:
+            time.sleep(0.01 - elapsed)
+
+    print("--- Robot is Ready! ---")
+
+    # Start the state machine and keyboard listener NOW that the robot is safely standing
+    threading.Thread(target=keyboard_listener_thread, daemon=True).start()
+    threading.Thread(target=state_machine_thread, daemon=True).start()
+
+    global current_h_left, current_h_right, current_shift_left, current_shift_right
+    global current_x_left, current_x_right, current_yaw_left, current_yaw_right
+    global current_torso_lean, current_arm_radians
+    
+    current_h_left = 0.23
+    current_h_right = 0.23
+    current_shift_left = 0.0
+    current_shift_right = 0.0
+    current_x_left = 0.0
+    current_x_right = 0.0
+    current_yaw_left = 0.0
+    current_yaw_right = 0.0
+    current_torso_lean = 0.0
+    current_arm_radians = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0}
+    
+    print("10-DOF Humanoid Step Controller Running via Dynamixel SDK!")
+    
+    # Target frequency: 100Hz
+    loop_time = 0.01 
+
+    while True:
+        if is_shutting_down or ik_override:
+            time.sleep(0.01)
+            continue
+            
+        start_time = time.perf_counter()
+
+        alpha = 0.05
+        current_h_left += (target_h_left - current_h_left) * alpha
+        current_h_right += (target_h_right - current_h_right) * alpha
+        current_shift_left += (target_shift_left - current_shift_left) * alpha
+        current_shift_right += (target_shift_right - current_shift_right) * alpha
+        current_x_left += (target_x_left - current_x_left) * alpha
+        current_x_right += (target_x_right - current_x_right) * alpha
+        current_torso_lean += (target_torso_lean - current_torso_lean) * alpha
+        current_yaw_left += (target_yaw_left - current_yaw_left) * alpha
+        current_yaw_right += (target_yaw_right - current_yaw_right) * alpha
+        for i in range(1, 7):
+            current_arm_radians[i] += (target_arm_radians[i] - current_arm_radians[i]) * (alpha * 0.5)
+
+        lh_hip, lh_knee, lh_ankle = compute_human_ik(current_h_left, current_x_left + current_torso_lean)
+        rh_hip, rh_knee, rh_ankle = compute_human_ik(current_h_right, current_x_right + current_torso_lean)
+
+        # APPLY URDF JOINT SIGNS from IK
+        rh = rh_hip
+        rk = -rh_knee
+        ra = rh_ankle
+        
+        lh = -lh_hip
+        lk = -lh_knee
+        la = lh_ankle
+
+        # ROLL CALCULATIONS (Parallelogram Fix)
+        HIP_ROLL_GAIN = 1.0
+        ANKLE_ROLL_GAIN = -1.0
+        left_roll = -HIP_ROLL_GAIN * current_shift_left
+        right_roll = -HIP_ROLL_GAIN * current_shift_right
+        left_ankle_roll = ANKLE_ROLL_GAIN * current_shift_left
+        right_ankle_roll = ANKLE_ROLL_GAIN * current_shift_right
+
+        # Map to specific hardware IDs
+        target_radians = {
+            1:  current_arm_radians[1],  # Right Shoulder Pitch
+            2:  current_arm_radians[2],  # Left Shoulder Pitch
+            3:  current_arm_radians[3],  # Right Shoulder Roll
+            4:  current_arm_radians[4],  # Left Shoulder Roll
+            5:  current_arm_radians[5],  # Right Elbow
+            6:  current_arm_radians[6],  # Left Elbow
+            
+            7:  current_yaw_left,  # Left Yaw
+            8:  current_yaw_right, # Right Yaw
+            9:  right_roll,        # Right Hip Roll
+            11: rh,                # Right Hip Pitch
+            13: rk,                # Right Knee
+            15: ra,                # Right Ankle Pitch
+            17: right_ankle_roll,  # Right Ankle Roll
+            
+            10: left_roll,         # Left Hip Roll
+            12: lh,                # Left Hip Pitch
+            14: lk,                # Left Knee
+            16: la,                # Left Ankle Pitch
+            18: left_ankle_roll    # Left Ankle Roll
+        }
+
+        # Clear the syncwrite payload
+        groupSyncWrite.clearParam()
+
+        # Populate the bulk packet with translated ticks
+        for motor_id, rad_angle in target_radians.items():
+            tick = rad_to_tick(motor_id, rad_angle)
+            param_goal_position = [DXL_LOBYTE(tick), DXL_HIBYTE(tick)]
+            groupSyncWrite.addParam(motor_id, param_goal_position)
+
+        # Blast all commands to the servos simultaneously
+        dxl_comm_result = groupSyncWrite.txPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            print(f"SyncWrite Error: {packetHandler.getTxRxResult(dxl_comm_result)}")
+
+        # Strict loop timing maintenance
+        elapsed = time.perf_counter() - start_time
+        if elapsed < loop_time:
+            time.sleep(loop_time - elapsed)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] Ctrl+C Detected! Triggering Safe Shutdown...")
+        abort_walk = True
+        try:
+            go_to_shutdown_pose()
+        except:
+            os._exit(0)
